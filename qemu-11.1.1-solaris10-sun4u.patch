@@ -1,0 +1,42 @@
+diff --git a/hw/ide/cmd646.c b/hw/ide/cmd646.c
+index d44a90a..ae6504f 100644
+--- a/hw/ide/cmd646.c
++++ b/hw/ide/cmd646.c
+@@ -57,16 +57,16 @@ static void cmd646_update_irq(PCIDevice *pd);
+ static void cmd646_update_dma_interrupts(PCIDevice *pd)
+ {
+     /* Sync DMA interrupt status from UDMA interrupt status */
++    /* CFR/ARTTIM23 are write-one-to-clear interrupt status latches.
++     * Deasserting an ATA interrupt clears MRDMODE's live indication,
++     * but must not discard the latched controller status. Solaris uata
++     * reads the ATA status before checking CFR. */
+     if (pd->config[MRDMODE] & MRDMODE_INTR_CH0) {
+         pd->config[CFR] |= CFR_INTR_CH0;
+-    } else {
+-        pd->config[CFR] &= ~CFR_INTR_CH0;
+     }
+ 
+     if (pd->config[MRDMODE] & MRDMODE_INTR_CH1) {
+         pd->config[ARTTIM23] |= ARTTIM23_INTR_CH1;
+-    } else {
+-        pd->config[ARTTIM23] &= ~ARTTIM23_INTR_CH1;
+     }
+ }
+ 
+@@ -184,10 +184,12 @@ static void cmd646_update_irq(PCIDevice *pd)
+ {
+     int pci_level;
+ 
+-    pci_level = ((pd->config[MRDMODE] & MRDMODE_INTR_CH0) &&
+-                 !(pd->config[MRDMODE] & MRDMODE_BLK_CH0)) ||
+-        ((pd->config[MRDMODE] & MRDMODE_INTR_CH1) &&
+-         !(pd->config[MRDMODE] & MRDMODE_BLK_CH1));
++    /* Hold PCI INTA for pending controller status until the guest clears it.
++     * Respect each channel's interrupt block bit. */
++    pci_level = !!(((pd->config[CFR] & CFR_INTR_CH0) &&
++                    !(pd->config[MRDMODE] & MRDMODE_BLK_CH0)) ||
++                   ((pd->config[ARTTIM23] & ARTTIM23_INTR_CH1) &&
++                    !(pd->config[MRDMODE] & MRDMODE_BLK_CH1)));
+     pci_set_irq(pd, pci_level);
+ }
+ 

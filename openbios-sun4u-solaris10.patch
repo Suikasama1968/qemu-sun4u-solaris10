@@ -1,0 +1,447 @@
+diff --git a/arch/sparc64/call-client.S b/arch/sparc64/call-client.S
+index 4129505..786ca51 100644
+--- a/arch/sparc64/call-client.S
++++ b/arch/sparc64/call-client.S
+@@ -44,6 +44,12 @@ sparc64_of_client_interface:
+ 	stx	%g6, [%sp + 2047 - 248 + 232]
+ 	stx	%g7, [%sp + 2047 - 248 + 240]
+ 
++	/* Keep the incoming PSTATE beside the saved globals. */
++	rdpr	%pstate, %g2
++	stx	%g2, [%sp + 2047 - 64]
++	andn	%g2, 2, %g3
++	wrpr	%g3, %pstate
++
+ 	/* Save existing stack */
+ 	setx	client_stack, %g6, %g7
+ 	stx	%sp, [%g7]
+@@ -75,7 +81,12 @@ sparc64_of_client_interface:
+ 	add	%g7, 8, %g7
+ 	stx	%g7, [%g1 + 0x4d0]
+ 	
+-	SAVE_CPU_STATE(cif)
++	SAVE_CPU_GENERAL_STATE(cif)
++	/* GENERAL_STATE saw IE cleared; retain the original client state. */
++	ldx	[%sp + 2047 - 64], %g7
++	stx	%g7, [%g1 + 0xb0]
++	SAVE_CPU_WINDOW_STATE(cif)
++	SAVE_CPU_TRAP_STATE(cif)
+ 	
+ 	RESET_CPU_WINDOW_STATE(cif)
+ 	
+@@ -97,10 +108,19 @@ sparc64_of_client_interface:
+ 	add	%g1, %g7, %g7
+ 	mov	%g7, %sp
+ 
++	/* Restore the incoming interrupt policy for normal CIF execution. */
++	ldx	[%g1 + 0xb0], %g7
++	wrpr	%g7, %pstate
++
+ 	/* Call client inteface */
+ 	call of_client_interface
+ 	 ldx	[%g1 + 0x70], %o0
+ 
++	/* Do not take an interrupt with a partially restored register file. */
++	rdpr	%pstate, %g2
++	andn	%g2, 2, %g3
++	wrpr	%g3, %pstate
++
+ 	/* Restore windows */
+ 	setx	_fcstack_ptr, %g6, %g7
+ 	ldx	[%g7], %g1
+@@ -117,7 +137,16 @@ sparc64_of_client_interface:
+ 	setx	__context, %g6, %g7
+ 	stx	%g3, [%g7]
+ 	
+-	RESTORE_CPU_STATE(cif)
++	/* Restore general state while keeping IE clear until globals are valid. */
++	ldx	[%g1 + 0xb0], %g7
++	andn	%g7, 2, %g7
++	wrpr	%g7, %pstate
++	ldx	[%g1 + 0xb8], %g7
++	wr	%g7, 0, %y
++	ldx	[%g1 + 0xc0], %g7
++	wr	%g7, 0, %fprs
++	RESTORE_CPU_WINDOW_STATE(cif)
++	RESTORE_CPU_TRAP_STATE(cif)
+ 	
+ 	add	%g1, CONTEXT_STATE_SIZE, %g5
+ 	setx	_fcstack_ptr, %g6, %g7
+@@ -131,12 +160,16 @@ sparc64_of_client_interface:
+ 	ldx	[%g1 + 0x4d0], %o7
+ 	
+ 	/* Restore globals */
+-	ldx	[%g1 + 0x38], %g2
+ 	ldx	[%g1 + 0x40], %g3
+ 	ldx	[%g1 + 0x48], %g4 
+ 	ldx	[%g1 + 0x50], %g5 
+ 	ldx	[%g1 + 0x58], %g6
+ 	ldx	[%g1 + 0x60], %g7
+ 	
++	/* SP, windows and g7 are now the client's again. */
++	ldx	[%g1 + 0xb0], %g2
++	wrpr	%g2, %pstate
++	ldx	[%g1 + 0x38], %g2
++
+ 	jmp	%o7
+ 	 ldx	[%g1 + 0x30], %g1
+diff --git a/arch/sparc64/init.fs b/arch/sparc64/init.fs
+index eb6c9da..59fc755 100644
+--- a/arch/sparc64/init.fs
++++ b/arch/sparc64/init.fs
+@@ -3,6 +3,11 @@
+ active-package 0 active-package!
+ defer va>tte-data
+ 0 to va>tte-data
++
++\ Solaris debugger initialization looks up this Sun OpenBoot hook.
++\ Keep its default action empty, as in Sun's OBP, until a debugger replaces it.
++defer debugger-vocabulary-hook
++' noop to debugger-vocabulary-hook
+ active-package!
+ 
+ :noname
+diff --git a/arch/sparc64/tree.fs b/arch/sparc64/tree.fs
+index f390f6c..98e4621 100644
+--- a/arch/sparc64/tree.fs
++++ b/arch/sparc64/tree.fs
+@@ -6,9 +6,13 @@ include config.fs
+ 
+ : decode-unit-upa ( str len -- id lun )
+   2 parse-nhex
++  \ Sabre has reg id 1fe, but Solaris names it pci@1f,0.
++  dup h# 1f = if drop h# 1fe then
+ ;
+ 
+ : encode-unit-upa ( id lun -- str len)
++  \ Keep the firmware path in sync with Solaris's Sabre device path.
++  dup h# 1fe = if drop h# 1f then
+   swap
+   pocket tohexstr
+   " ," pocket tmpstrcat >r
+diff --git a/drivers/ide.c b/drivers/ide.c
+index 4cc572c..e91f3a7 100644
+--- a/drivers/ide.c
++++ b/drivers/ide.c
+@@ -33,7 +33,12 @@ do { printk("IDE - %s: " fmt, __func__ , ##args); } while (0)
+ 
+ /* DECLARE data structures for the nodes.  */
+ DECLARE_UNNAMED_NODE( ob_ide, 0, sizeof(struct ide_drive*) );
++#ifndef CONFIG_SPARC64
+ DECLARE_UNNAMED_NODE( ob_ide_ctrl, 0, sizeof(int));
++#endif
++#ifdef CONFIG_SPARC64
++DECLARE_UNNAMED_NODE( ob_ide_sparc64_bus, 0, 0 );
++#endif
+ 
+ /*
+  * define to 2 for the standard 2 channels only
+@@ -1281,6 +1286,7 @@ NODE_METHODS(ob_ide) = {
+ 	{ "dma-sync",		ob_ide_dma_sync		},
+ };
+ 
++#ifndef CONFIG_SPARC64
+ static void
+ ob_ide_ctrl_decodeunit(int *idx)
+ {
+@@ -1308,6 +1314,44 @@ NODE_METHODS(ob_ide_ctrl) = {
+ 	{ "dma-map-out",	ob_ide_dma_map_out	},
+ 	{ "dma-sync",		ob_ide_dma_sync		},
+ };
++#endif
++
++#ifdef CONFIG_SPARC64
++/* Solaris identifies IDE drives directly below the PCI controller as
++ * disk@target,lun and cdrom@target,lun.  Channel one starts at target 2. */
++static void ob_ide_sparc64_decode_unit(int *idx)
++{
++	char *unit = pop_fstr_copy();
++	char *end;
++	ucell target = strtol(unit, &end, 16);
++	ucell lun = (*end == ',') ? strtol(end + 1, NULL, 16) : 0;
++
++	free(unit);
++	PUSH(lun);
++	PUSH(target);
++}
++
++static void ob_ide_sparc64_encode_unit(int *idx)
++{
++	char unit[32];
++	ucell target = POP();
++	ucell lun = POP();
++
++	snprintf(unit, sizeof(unit), "%x,%x", (unsigned int)target,
++	         (unsigned int)lun);
++	push_str(unit);
++}
++
++NODE_METHODS(ob_ide_sparc64_bus) = {
++	{ "decode-unit", ob_ide_sparc64_decode_unit },
++	{ "encode-unit", ob_ide_sparc64_encode_unit },
++	{ "dma-alloc", ob_ide_dma_alloc },
++	{ "dma-free", ob_ide_dma_free },
++	{ "dma-map-in", ob_ide_dma_map_in },
++	{ "dma-map-out", ob_ide_dma_map_out },
++	{ "dma-sync", ob_ide_dma_sync },
++};
++#endif
+ 
+ static void set_cd_alias(const char *path)
+ {
+@@ -1363,6 +1407,15 @@ int ob_ide_init(const char *path, uint32_t io_port0, uint32_t ctl_port0,
+ 	io_ports[1] = io_port1;
+ 	ctl_ports[1] = ctl_port1;
+ 
++#ifdef CONFIG_SPARC64
++	/* The PCI IDE node, not a synthetic per-channel node, is the parent
++	 * of the two-cell target/lun addresses on sun4u. */
++	dnode = get_cur_dev();
++	set_int_property(dnode, "#address-cells", 2);
++	set_int_property(dnode, "#size-cells", 0);
++	BIND_NODE_METHODS(dnode, ob_ide_sparc64_bus);
++#endif
++
+ 	for (i = 0; i < IDE_NUM_CHANNELS; i++, current_channel++) {
+ 
+ 		chan = malloc(sizeof(struct ide_channel));
+@@ -1404,6 +1457,7 @@ int ob_ide_init(const char *path, uint32_t io_port0, uint32_t ctl_port0,
+ 
+ 		ob_ide_identify_drives(chan);
+ 
++#ifndef CONFIG_SPARC64
+ 		fword("new-device");
+ 		dnode = get_cur_dev();
+ 
+@@ -1435,6 +1489,7 @@ int ob_ide_init(const char *path, uint32_t io_port0, uint32_t ctl_port0,
+ 		IDE_DPRINTF(DEV_NAME": [io ports 0x%x-0x%x,0x%x]\n",
+ 		            current_channel, chan->io_regs[0],
+ 		            chan->io_regs[0] + 7, chan->io_regs[8]);
++#endif
+ 
+ 		for (j = 0; j < 2; j++) {
+ 			struct ide_drive *drive = &chan->drives[j];
+@@ -1464,13 +1519,27 @@ int ob_ide_init(const char *path, uint32_t io_port0, uint32_t ctl_port0,
+ 
+ 			fword("new-device");
+ 			dnode = get_cur_dev();
++#ifdef CONFIG_SPARC64
++			props[0] = __cpu_to_be32(i * 2 + j);
++			props[1] = 0;
++			set_property(dnode, "reg", (char *)props, 2*sizeof(props[0]));
++#else
+ 			set_int_property(dnode, "reg", j);
++#endif
+ 			push_str(media);
+ 			fword("device-name");
+ 
+ 			push_str("block");
+ 			fword("device-type");
+ 
++#ifdef CONFIG_SPARC64
++			/* Solaris binds the firmware disk node to dad through
++			 * the ide-disk driver alias. */
++			if (drive->media == ide_media_disk)
++				set_property(dnode, "compatible", "ide-disk",
++				             sizeof("ide-disk"));
++#endif
++
+ 			PUSH(pointer2cell(drive));
+ 			feval("value drive");
+ 
+@@ -1489,7 +1558,9 @@ int ob_ide_init(const char *path, uint32_t io_port0, uint32_t ctl_port0,
+ 				set_hd_alias(nodebuff);
+ 		}
+ 
++#ifndef CONFIG_SPARC64
+ 		fword("finish-device");
++#endif
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/pc_serial.c b/drivers/pc_serial.c
+index f67383d..27a326f 100644
+--- a/drivers/pc_serial.c
++++ b/drivers/pc_serial.c
+@@ -112,6 +112,11 @@ pc_serial_read(unsigned long *address)
+ 
+     if (uart_charav(*address)) {
+         *addr = (char)uart_getchar(*address);
++#ifdef CONFIG_SPARC64
++        /* OpenBIOS accept expects LF; the stdio serial console sends CR. */
++        if (*addr == '\r')
++            *addr = '\n';
++#endif
+         PUSH(1);
+     } else {
+         PUSH(0);
+@@ -146,6 +151,11 @@ pc_serial_open(unsigned long *address)
+     fword("execute");
+     *address = POP();
+ 
++#ifdef CONFIG_SPARC64
++    /* Solaris leaves UART interrupts enabled; PROM uses polled input. */
++    outb(0x00, IER(*address));
++#endif
++
+     RET ( -1 );
+ }
+ 
+diff --git a/drivers/pci.c b/drivers/pci.c
+index f30e427..197f281 100644
+--- a/drivers/pci.c
++++ b/drivers/pci.c
+@@ -52,6 +52,7 @@
+ 
+ DECLARE_UNNAMED_NODE( ob_pci_bus_node, INSTALL_OPEN, 2*sizeof(int) );
+ DECLARE_UNNAMED_NODE( ob_pci_bridge_node, INSTALL_OPEN, 2*sizeof(int) );
++DECLARE_UNNAMED_NODE( ob_ebus_node, INSTALL_OPEN, 2*sizeof(int) );
+ DECLARE_UNNAMED_NODE( ob_pci_simple_node, 0, 2*sizeof(int) );
+ 
+ const pci_arch_t *arch;
+@@ -489,6 +490,43 @@ NODE_METHODS(ob_pci_bridge_node) = {
+ 	{ "dma-sync",		ob_pci_dma_sync		},
+ };
+ 
++/* The EBus child address consists of a BAR register and an offset. */
++static void ob_ebus_decode_unit(int *idx)
++{
++    char *unit = pop_fstr_copy();
++    char *end;
++    ucell bar = strtol(unit, &end, 16);
++    ucell offset = (*end == ',') ? strtol(end + 1, NULL, 16) : 0;
++
++    free(unit);
++    PUSH(offset);
++    PUSH(bar);
++}
++
++static void ob_ebus_encode_unit(int *idx)
++{
++    char unit[32];
++    ucell bar = POP();
++    ucell offset = POP();
++
++    snprintf(unit, sizeof(unit), "%x,%x", (unsigned int)bar,
++             (unsigned int)offset);
++    push_str(unit);
++}
++
++NODE_METHODS(ob_ebus_node) = {
++    { "open",        ob_pci_open           },
++    { "close",       ob_pci_close          },
++    { "decode-unit", ob_ebus_decode_unit   },
++    { "encode-unit", ob_ebus_encode_unit   },
++    { "pci-map-in",  ob_pci_bridge_map_in  },
++    { "dma-alloc",   ob_pci_dma_alloc      },
++    { "dma-free",    ob_pci_dma_free       },
++    { "dma-map-in",  ob_pci_dma_map_in     },
++    { "dma-map-out", ob_pci_dma_map_out    },
++    { "dma-sync",    ob_pci_dma_sync       },
++};
++
+ NODE_METHODS(ob_pci_simple_node) = {
+ 	{ "open",		ob_pci_open		},
+ 	{ "close",		ob_pci_close		},
+@@ -1154,11 +1192,6 @@ int ebus_config_cb(const pci_config_t *config)
+     push_str("reg");
+     fword("property");
+ 
+-    PUSH(0);
+-    PUSH(0);
+-    push_str("button");
+-    fword("property");
+-
+     PUSH(1);
+     fword("encode-int");
+     push_str("interrupts");
+@@ -1175,7 +1208,10 @@ int ebus_config_cb(const pci_config_t *config)
+     fword("device-name");
+     fword("finish-device");
+ 
+-#ifdef CONFIG_DRIVER_FLOPPY
++    /* QEMU sun4u provides a non-DMA ISA FDC, not the Cheerio controller
++     * expected by Solaris's fdthree binding.  Do not publish an incomplete
++     * fdthree node (or its floppy alias) on SPARC64. */
++#if defined(CONFIG_DRIVER_FLOPPY) && !defined(CONFIG_SPARC64)
+     ob_floppy_init(config->path, "fdthree", 0x3f0ULL, 0);
+ #endif
+ #ifdef CONFIG_DRIVER_PC_SERIAL
+@@ -1830,7 +1866,11 @@ static phandle_t ob_configure_pci_device(const char* parent_path,
+     switch (class) {
+     case PCI_BASE_CLASS_BRIDGE:
+         if (subclass != PCI_SUBCLASS_BRIDGE_HOST) {
+-            BIND_NODE_METHODS(phandle, ob_pci_bridge_node);
++            if (vid == PCI_VENDOR_ID_SUN && did == PCI_DEVICE_ID_SUN_EBUS) {
++                BIND_NODE_METHODS(phandle, ob_ebus_node);
++            } else {
++                BIND_NODE_METHODS(phandle, ob_pci_bridge_node);
++            }
+         } else {
+             BIND_NODE_METHODS(phandle, ob_pci_bus_node);
+         }
+diff --git a/forth/device/table.fs b/forth/device/table.fs
+index 04d22c8..9b00a6e 100644
+--- a/forth/device/table.fs
++++ b/forth/device/table.fs
+@@ -414,8 +414,8 @@ create fcode-master-table
+   ['], x!
+   ['], /x
+   ['], /x*
+-\   ['], /xa+
+-\   ['], /xa1+
++  ['], xa+
++  ['], xa1+
+   ['], xbflip
+   ['], xbflips
+   ['], xbsplit
+diff --git a/forth/system/ciface.fs b/forth/system/ciface.fs
+index 146561a..85fa743 100644
+--- a/forth/system/ciface.fs
++++ b/forth/system/ciface.fs
+@@ -354,6 +354,24 @@ external
+   power-off
+ ;
+ 
++\ QEMU sun4u has no Automatic System Recovery database.  Solaris expects
++\ a length of -1 when these firmware services are unavailable.
++: SUNW,asr-export-len ( -- len )
++  -1
++;
++
++: SUNW,asr-list-keys-len ( -- len )
++  -1
++;
++
++: SUNW,asr-export ( buffer -- len )
++  drop -1
++;
++
++: SUNW,asr-list-keys ( buffer -- len )
++  drop -1
++;
++
+ [THEN]
+ 
+ finish-device
+diff --git a/libopenbios/client.c b/libopenbios/client.c
+index 8b3d582..82c2f99 100644
+--- a/libopenbios/client.c
++++ b/libopenbios/client.c
+@@ -312,6 +312,16 @@ of_client_interface(int *params)
+             pb->nargs + pb->nret > PROM_MAX_ARGS)
+ 		return -1;
+ 
++#ifdef CONFIG_SPARC64
++	/* Solaris calls exit after unmounting the root filesystem.  Restore
++	 * the firmware console before returning to the OpenBIOS prompt. */
++	if (!strcmp(get_service(pb), "exit")) {
++		fword("install-console");
++		fword("outer-interpreter");
++		return -1;
++	}
++#endif
++
+ #ifdef DEBUG_CIF
+ 	dump_service(pb);
+ #endif
